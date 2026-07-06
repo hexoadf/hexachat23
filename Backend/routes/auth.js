@@ -13,14 +13,15 @@ router.post('/signup', signupValidation, validate, async (req, res) => {
     const result = await authService.signup(req.body);
     res.status(201).json({ success: true, ...result });
   } catch (err) {
-    res.status(400).json({ success: false, message: err.message });
+    console.error('Signup error:', err.message || err);
+    res.status(400).json({ success: false, message: err.message || 'Signup failed' });
   }
 });
 
 router.post('/verify-otp', otpValidation, validate, async (req, res) => {
   try {
     const { email, otp, type } = req.body;
-    const result = await authService.verifyOTP(email, otp, type || 'verification');
+    const result = await authService.verifyOTP(email, otp, type || 'signup');
     if (result.token) {
       res.cookie('token', result.token, {
         httpOnly: true, secure: process.env.NODE_ENV === 'production',
@@ -35,7 +36,7 @@ router.post('/verify-otp', otpValidation, validate, async (req, res) => {
 
 router.post('/resend-otp', emailValidation, validate, async (req, res) => {
   try {
-    const result = await authService.resendOTP(req.body.email, req.body.type || 'verification');
+    const result = await authService.resendOTP(req.body.email, req.body.type || 'signup');
     res.json({ success: true, ...result });
   } catch (err) {
     res.status(400).json({ success: false, message: err.message });

@@ -1,30 +1,57 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.SMTP_PORT || '587', 10),
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
+const SMTP_USER = (process.env.SMTP_USER || process.env.GMAIL_USER || '').trim();
+const SMTP_PASS = (process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '').replace(/\s/g, '');
+
+function createTransporter() {
+  if (SMTP_USER && SMTP_PASS) {
+    return nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+      connectionTimeout: 8000,
+      greetingTimeout: 8000,
+      socketTimeout: 10000
+    });
   }
-});
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: process.env.SMTP_SECURE === 'true',
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 10000
+  });
+}
+
+const transporter = createTransporter();
+
+function isSmtpConfigured() {
+  return !!(SMTP_USER && SMTP_PASS);
+}
 
 async function sendOTPEmail(to, otp, type = 'verification') {
   const subjects = {
     verification: 'HexaChat - Verify Your Email',
+    signup: 'HexaChat - Verify Your Email',
     reset: 'HexaChat - Password Reset OTP',
     login: 'HexaChat - Login OTP'
   };
 
   const messages = {
     verification: 'Use this OTP to verify your HexaChat account:',
+    signup: 'Use this OTP to verify your HexaChat account:',
     reset: 'Use this OTP to reset your HexaChat password:',
     login: 'Use this OTP to login to HexaChat:'
   };
 
+  if (!isSmtpConfigured()) {
+    console.warn(`[OTP] SMTP not configured — OTP for ${to}: ${otp}`);
+    return { sent: false, reason: 'smtp_not_configured' };
+  }
+
+  const from = process.env.SMTP_FROM || `HexaChat <${SMTP_USER}>`;
   const mailOptions = {
-    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    from,
     to,
     subject: subjects[type] || subjects.verification,
     html: `
@@ -39,7 +66,26 @@ async function sendOTPEmail(to, otp, type = 'verification') {
     `
   };
 
-  await transporter.sendMail(mailOptions);
+  const sendPromise = transporter.sendMail(mailOptions);
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('SMTP connection timed out')), 10000);
+  });
+
+  try {
+    await Promise.race([sendPromise, timeoutPromise]);
+    console.log(`[OTP] Email sent to ${to}`);
+    return { sent: true };
+  } catch (err) {
+    console.error(`[OTP] Email failed for ${to}:`, err.message);
+    console.warn(`[OTP] OTP code for ${to}: ${otp}`);
+    return { sent: false, reason: err.message };
+  }
 }
 
-module.exports = { transporter, sendOTPEmail };
+function sendOTPEmailAsync(to, otp, type = 'signup') {
+  sendOTPEmail(to, otp, type).catch((err) => {
+    console.error(`[OTP] Background send error for ${to}:`, err.message);
+  });
+}
+
+module.exports = { transporter, sendOTPEmail, sendOTPEmailAsync, isSmtpConfigured };

@@ -1,0 +1,9 @@
+# Force Node.js in the Nixpacks build image (fixes "npm: command not found")
+[phases.setup]
+nixPkgs = ["nodejs_20"]
+
+[phases.install]
+cmds = ["npm ci --omit=dev || npm install --omit=dev"]
+
+[start]
+cmd = "node server.js"

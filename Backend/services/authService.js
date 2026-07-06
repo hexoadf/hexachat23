@@ -1,5 +1,5 @@
 const supabase = require('../config/database');
-const { sendOTPEmail } = require('../config/mailer');
+const { sendOTPEmail, sendOTPEmailAsync } = require('../config/mailer');
 const { generateOTP, getOTPExpiry } = require('../utils/otp');
 const { hashPassword, comparePassword, sanitizeInput, formatPhone } = require('../utils/helpers');
 const { generateToken } = require('../utils/jwt');
@@ -34,16 +34,19 @@ async function signup({ name, email, phone_number, password }) {
     used: false
   });
 
-  if (otpError) throw otpError;
+  if (otpError) {
+    throw new Error(otpError.message || 'Could not save OTP');
+  }
 
   if (existing) {
-    await supabase.from('users').update({
+    const { error: updateError } = await supabase.from('users').update({
       name: cleanName,
       phone_number: cleanPhone,
       password_hash: passwordHash,
       is_verified: false,
       updated_at: new Date().toISOString()
     }).eq('id', existing.id);
+    if (updateError) throw new Error(updateError.message || 'Could not update account');
   } else {
     const { error: userError } = await supabase.from('users').insert({
       name: cleanName,
@@ -52,11 +55,15 @@ async function signup({ name, email, phone_number, password }) {
       password_hash: passwordHash,
       is_verified: false
     });
-    if (userError) throw userError;
+    if (userError) throw new Error(userError.message || 'Could not create account');
   }
 
-  await sendOTPEmail(cleanEmail, otp, 'verification');
-  return { message: 'OTP sent to your email', email: cleanEmail };
+  sendOTPEmailAsync(cleanEmail, otp, 'signup');
+  return {
+    message: 'OTP sent to your email. Check inbox and spam folder.',
+    email: cleanEmail,
+    emailSent: true
+  };
 }
 
 async function verifyOTP(email, otp, type = 'signup') {
@@ -134,8 +141,8 @@ async function resendOTP(email, type = 'signup') {
     used: false
   });
 
-  await sendOTPEmail(cleanEmail, otp, type);
-  return { message: 'OTP resent successfully' };
+  sendOTPEmailAsync(cleanEmail, otp, type);
+  return { message: 'OTP sent to your email', emailSent: true };
 }
 
 async function login(email, password) {
@@ -160,7 +167,7 @@ async function login(email, password) {
       email: cleanEmail, code: otp, type: 'signup',
       expires_at: expiresAt.toISOString(), used: false
     });
-    await sendOTPEmail(cleanEmail, otp, 'verification');
+    sendOTPEmailAsync(cleanEmail, otp, 'signup');
     return { requiresVerification: true, email: cleanEmail, message: 'Please verify your email' };
   }
 
