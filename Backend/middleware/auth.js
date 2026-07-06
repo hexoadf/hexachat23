@@ -1,18 +1,49 @@
-const jwt = require('jsonwebtoken');
-require('dotenv').config();
+const { verifyToken } = require('../utils/jwt');
+const supabase = require('../config/database');
 
-function authMiddleware(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+async function authenticate(req, res, next) {
   try {
-    const token = header.split(' ')[1];
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : req.cookies?.token;
+
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    const decoded = verifyToken(token);
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, name, email, phone_number, profile_photo, is_verified, last_seen, bio, about, is_online')
+      .eq('id', decoded.userId)
+      .single();
+
+    if (error || !user) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+    }
+
+    if (!user.is_verified) {
+      return res.status(403).json({ success: false, message: 'Email not verified' });
+    }
+
+    req.user = user;
+    req.userId = user.id;
     next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch (err) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
   }
 }
 
-module.exports = authMiddleware;
+function optionalAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : req.cookies?.token;
+  if (!token) return next();
+  try {
+    const decoded = verifyToken(token);
+    req.userId = decoded.userId;
+  } catch {
+    // ignore
+  }
+  next();
+}
+
+module.exports = { authenticate, optionalAuth };

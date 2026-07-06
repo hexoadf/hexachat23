@@ -1,97 +1,71 @@
 const express = require('express');
-const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const authMiddleware = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
+const contactService = require('../services/contactService');
+const { body } = require('../middleware/validators');
+const { validate } = require('../middleware/validation');
 
 const router = express.Router();
 
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/blocked/list', authenticate, async (req, res) => {
   try {
-    const { data: contacts } = await supabase
-      .from('contacts')
-      .select('id, contact_id')
-      .eq('user_id', req.user.id);
-
-    const ids = (contacts || []).map((c) => c.contact_id);
-    if (!ids.length) return res.json({ contacts: [] });
-
-    const { data: users } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .in('id', ids);
-
-    const userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-
-    res.json({
-      contacts: (contacts || []).map((c) => ({
-        id: c.id,
-        contact: userMap[c.contact_id] || null
-      }))
-    });
+    const blocked = await contactService.getBlockedUsers(req.userId);
+    res.json({ success: true, blocked });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch contacts' });
+    res.status(500).json({ success: false, message: err.message });
   }
 });
 
-router.post('/add', authMiddleware, async (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   try {
-    const phone = (req.body.phone_number || '').trim();
-    if (!phone) return res.status(400).json({ error: 'Phone number required' });
-
-    const { data: contactUser } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .eq('phone', phone)
-      .maybeSingle();
-
-    if (!contactUser) {
-      return res.status(404).json({ error: 'No user found with this number' });
-    }
-
-    if (contactUser.id === req.user.id) {
-      return res.status(400).json({ error: 'Cannot add yourself' });
-    }
-
-    const { data: existing } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('contact_id', contactUser.id)
-      .maybeSingle();
-
-    if (existing) {
-      return res.status(400).json({ error: 'Contact already added' });
-    }
-
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({ user_id: req.user.id, contact_id: contactUser.id })
-      .select('id, contact_id')
-      .single();
-
-    if (error) throw error;
-
-    const { data: reverseExists } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('user_id', contactUser.id)
-      .eq('contact_id', req.user.id)
-      .maybeSingle();
-
-    if (!reverseExists) {
-      await supabase.from('contacts').insert({
-        user_id: contactUser.id,
-        contact_id: req.user.id
-      });
-    }
-
-    res.json({
-      success: true,
-      contact: { ...contact, contact: formatUser(contactUser) }
-    });
+    const contacts = await contactService.getContacts(req.userId);
+    res.json({ success: true, contacts });
   } catch (err) {
-    console.error('Add contact error:', err);
-    res.status(500).json({ error: 'Failed to add contact' });
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/add', authenticate, [body('contact_id').isUUID()], validate, async (req, res) => {
+  try {
+    const result = await contactService.addContact(req.userId, req.body.contact_id);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/:contactId', authenticate, async (req, res) => {
+  try {
+    const result = await contactService.removeContact(req.userId, req.params.contactId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:contactId/favorite', authenticate, async (req, res) => {
+  try {
+    const result = await contactService.toggleFavorite(req.userId, req.params.contactId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:contactId/block', authenticate, async (req, res) => {
+  try {
+    const result = await contactService.blockUser(req.userId, req.params.contactId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:contactId/unblock', authenticate, async (req, res) => {
+  try {
+    const result = await contactService.unblockUser(req.userId, req.params.contactId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
   }
 });
 

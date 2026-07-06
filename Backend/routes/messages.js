@@ -1,182 +1,173 @@
 const express = require('express');
-const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const authMiddleware = require('../middleware/auth');
+const { authenticate } = require('../middleware/auth');
+const messageService = require('../services/messageService');
+const groupService = require('../services/groupService');
+const { upload } = require('../middleware/upload');
+const { validate } = require('../middleware/validation');
+const { messageValidation, body } = require('../middleware/validators');
 
 const router = express.Router();
 
-function formatMessage(msg) {
-  if (!msg) return msg;
-  return {
-    ...msg,
-    sender: msg.sender ? formatUser(msg.sender) : undefined
-  };
-}
-
-router.get('/conversations', authMiddleware, async (req, res) => {
+router.get('/search/all', authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const q = req.query.q || '';
+    if (!q) return res.json({ success: true, messages: [] });
+    const messages = await messageService.searchMessages(req.userId, q);
+    res.json({ success: true, messages });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
 
-    const { data: directMsgs, error: msgErr } = await supabase
-      .from('messages')
-      .select('*')
-      .or(`sender_id.eq.${userId},receiver_id.eq.${userId}`)
-      .is('group_id', null)
-      .order('created_at', { ascending: false });
+router.post('/upload', authenticate, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'File required' });
+    const result = await messageService.uploadMedia(req.file, req.userId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
 
-    if (msgErr) console.error('Conversations messages error:', msgErr);
-
-    const convMap = new Map();
-    for (const msg of directMsgs || []) {
-      const otherId = msg.sender_id === userId ? msg.receiver_id : msg.sender_id;
-      if (!otherId || convMap.has(otherId)) continue;
-      convMap.set(otherId, msg);
-    }
-
-    const otherIds = Array.from(convMap.keys());
-    let users = [];
-    if (otherIds.length) {
-      const { data } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', otherIds);
-      users = data || [];
-    }
-
-    const userMap = Object.fromEntries(users.map((u) => [u.id, formatUser(u)]));
-    const directConversations = otherIds.map((id) => ({
-      type: 'direct',
-      user: userMap[id],
-      lastMessage: convMap.get(id)
-    }));
-
-    const { data: memberships } = await supabase
-      .from('group_members')
-      .select('group_id')
-      .eq('user_id', userId);
-
-    const groupIds = (memberships || []).map((m) => m.group_id);
-    let groupConversations = [];
-
-    if (groupIds.length) {
-      const { data: groups } = await supabase
-        .from('groups')
-        .select('id, name')
-        .in('id', groupIds);
-
-      for (const group of groups || []) {
-        const { data: lastMsg } = await supabase
-          .from('messages')
-          .select('*')
-          .eq('group_id', group.id)
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle();
-
-        groupConversations.push({
-          type: 'group',
-          group,
-          lastMessage: lastMsg
+router.post('/', authenticate, messageValidation, validate, async (req, res) => {
+  try {
+    const message = await messageService.sendMessage(req.userId, req.body);
+    const { blocked_by_receiver, ...safeMessage } = message;
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`user:${req.userId}`).emit('new_message', safeMessage);
+      if (message.group_id) {
+        io.to(`conversation:${message.conversation_id}`).emit('new_message', safeMessage);
+        const memberIds = await groupService.getGroupMemberIds(message.group_id);
+        const preview = message.content || (message.message_type !== 'text' ? 'Sent an attachment' : '');
+        for (const id of memberIds) {
+          if (id === req.userId) continue;
+          io.to(`user:${id}`).emit('new_message', safeMessage);
+          io.to(`user:${id}`).emit('notification', {
+            type: 'message',
+            title: message.sender?.name || 'Group message',
+            body: preview,
+            data: { conversation_id: message.conversation_id, group_id: message.group_id }
+          });
+        }
+      } else if (message.receiver_id && !blocked_by_receiver) {
+        io.to(`user:${message.receiver_id}`).emit('new_message', safeMessage);
+        io.to(`user:${message.receiver_id}`).emit('notification', {
+          type: 'message', title: message.sender?.name || 'New Message',
+          body: message.content || 'Sent an attachment', data: { conversation_id: message.conversation_id }
         });
       }
     }
-
-    const { data: contacts, error: contactErr } = await supabase
-      .from('contacts')
-      .select('contact_id')
-      .eq('user_id', userId);
-
-    if (contactErr) console.error('Contacts error:', contactErr);
-
-    let contactUsers = [];
-    const contactIds = (contacts || []).map((c) => c.contact_id);
-    if (contactIds.length) {
-      const { data } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', contactIds);
-      contactUsers = (data || []).map(formatUser);
-    }
-
-    res.json({
-      conversations: [...directConversations, ...groupConversations],
-      contacts: contactUsers
-    });
+    res.status(201).json({ success: true, message: safeMessage });
   } catch (err) {
-    console.error('Conversations error:', err);
-    res.status(500).json({ error: 'Failed to load conversations' });
+    res.status(400).json({ success: false, message: err.message });
   }
 });
 
-router.get('/direct/:userId', authMiddleware, async (req, res) => {
+router.get('/:conversationId', authenticate, async (req, res) => {
   try {
-    const userId = req.user.id;
-    const otherId = req.params.userId;
-
-    const { data: messages, error } = await supabase
-      .from('messages')
-      .select('*')
-      .or(
-        `and(sender_id.eq.${userId},receiver_id.eq.${otherId}),and(sender_id.eq.${otherId},receiver_id.eq.${userId})`
-      )
-      .is('group_id', null)
-      .order('created_at', { ascending: true });
-
-    if (error) {
-      console.error('Load direct messages error:', error);
-      return res.status(500).json({ error: 'Failed to load messages' });
-    }
-
-    const senderIds = [...new Set((messages || []).map((m) => m.sender_id))];
-    let senderMap = {};
-    if (senderIds.length) {
-      const { data: senders } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', senderIds);
-      senderMap = Object.fromEntries((senders || []).map((s) => [s.id, s]));
-    }
-
-    res.json({
-      messages: (messages || []).map((m) =>
-        formatMessage({ ...m, sender: senderMap[m.sender_id] })
-      )
-    });
+    const page = parseInt(req.query.page || '1', 10);
+    const limit = parseInt(req.query.limit || '50', 10);
+    const messages = await messageService.getMessages(req.params.conversationId, req.userId, page, limit);
+    const pinned = await messageService.getPinnedMessage(req.params.conversationId);
+    res.json({ success: true, messages, pinned });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to load messages' });
+    res.status(400).json({ success: false, message: err.message });
   }
 });
 
-router.get('/group/:groupId', authMiddleware, async (req, res) => {
+router.post('/:conversationId/read', authenticate, async (req, res) => {
   try {
-    const { data: messages, error } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('group_id', req.params.groupId)
-      .order('created_at', { ascending: true });
-
-    if (error) {
-      console.error('Load group messages error:', error);
-      return res.status(500).json({ error: 'Failed to load group messages' });
-    }
-
-    const senderIds = [...new Set((messages || []).map((m) => m.sender_id))];
-    let senderMap = {};
-    if (senderIds.length) {
-      const { data: senders } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', senderIds);
-      senderMap = Object.fromEntries((senders || []).map((s) => [s.id, s]));
-    }
-
-    res.json({
-      messages: (messages || []).map((m) =>
-        formatMessage({ ...m, sender: senderMap[m.sender_id] })
-      )
-    });
+    const result = await messageService.markAsRead(req.params.conversationId, req.userId);
+    const io = req.app.get('io');
+    if (io) io.to(`conversation:${req.params.conversationId}`).emit('messages_read', { conversation_id: req.params.conversationId, user_id: req.userId });
+    res.json({ success: true, ...result });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to load group messages' });
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.put('/:messageId', authenticate, [body('content').notEmpty()], validate, async (req, res) => {
+  try {
+    const message = await messageService.editMessage(req.params.messageId, req.userId, req.body.content);
+    const io = req.app.get('io');
+    if (io) io.to(`conversation:${message.conversation_id}`).emit('message_edited', message);
+    res.json({ success: true, message });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/:messageId/me', authenticate, async (req, res) => {
+  try {
+    const result = await messageService.deleteForMe(req.params.messageId, req.userId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/:messageId/everyone', authenticate, async (req, res) => {
+  try {
+    const result = await messageService.deleteForEveryone(req.params.messageId, req.userId);
+    const io = req.app.get('io');
+    if (io) io.emit('message_deleted', result);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:messageId/pin', authenticate, [body('conversation_id').isUUID()], validate, async (req, res) => {
+  try {
+    const pinned = await messageService.pinMessage(req.params.messageId, req.userId, req.body.conversation_id);
+    const io = req.app.get('io');
+    if (io) io.to(`conversation:${req.body.conversation_id}`).emit('message_pinned', pinned);
+    res.json({ success: true, pinned });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/pin/:conversationId', authenticate, async (req, res) => {
+  try {
+    const result = await messageService.unpinMessage(req.params.conversationId);
+    const io = req.app.get('io');
+    if (io) io.to(`conversation:${req.params.conversationId}`).emit('message_unpinned', { conversation_id: req.params.conversationId });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:messageId/star', authenticate, async (req, res) => {
+  try {
+    const result = await messageService.starMessage(req.params.messageId, req.userId);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.post('/:messageId/reaction', authenticate, [body('reaction').notEmpty()], validate, async (req, res) => {
+  try {
+    const reaction = await messageService.addReaction(req.params.messageId, req.userId, req.body.reaction);
+    const io = req.app.get('io');
+    if (io) io.emit('message_reaction', { message_id: req.params.messageId, reaction });
+    res.json({ success: true, reaction });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+router.delete('/:messageId/reaction', authenticate, async (req, res) => {
+  try {
+    const result = await messageService.removeReaction(req.params.messageId, req.userId);
+    const io = req.app.get('io');
+    if (io) io.emit('message_reaction_removed', { message_id: req.params.messageId, user_id: req.userId });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
   }
 });
 
